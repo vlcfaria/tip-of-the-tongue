@@ -1,5 +1,6 @@
 from Experiment import Experiment, parse_arguments
 import pyterrier as pt
+from tsvHandler import tsv_corpus_generator
 from jsonlHandler import iter_jsonl, transform_raw
 
 class BM25(Experiment):
@@ -18,7 +19,7 @@ class BM25(Experiment):
     def build_index(self, index_path: str, corpus_path: str):
         #Index raw data
         return (pt.IterDictIndexer(index_path, meta={'docno': 20}, blocks=True, threads=8)
-                    .index(iter_jsonl(corpus_path, transform_raw)))
+                    .index(tsv_corpus_generator(corpus_path)))
 
 #Example usage
 if __name__ == '__main__':

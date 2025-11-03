@@ -19,7 +19,7 @@ def parse_arguments():
     parser.add_argument(
         'index_path',
         type=str,
-        help='Path to the Terrier index directory.'
+        help='Path to the index directory.'
     )
 
     parser.add_argument(

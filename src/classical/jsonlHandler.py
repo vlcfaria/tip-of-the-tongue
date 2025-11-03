@@ -3,7 +3,7 @@ import json
 def iter_jsonl(filename: str, transform):
     'Index an entity jsonl file, calling `transform` for every loaded json entity'
 
-    with open(filename, 'rt') as file:
+    with open(filename, 'rt', encoding='utf-8') as file:
         for l in file:
             raw = json.loads(l)
 

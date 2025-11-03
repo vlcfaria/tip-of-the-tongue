@@ -1,11 +1,9 @@
 from Experiment import Experiment, parse_arguments
-from jsonlHandler import iter_jsonl, transform_raw
+from tsvHandler import tsv_corpus_generator
 import pyterrier as pt
 import pyterrier_alpha as pta
 import pyt_splade
 from pyterrier_pisa import PisaIndex
-import json
-import torch
 
 class SPLADE(Experiment):
     '''SPLADE experimentation'''
@@ -26,9 +24,9 @@ class SPLADE(Experiment):
         #Index raw data
         index = PisaIndex(index_path, stemmer='none')
 
-        idx_pipeline = self.splade.doc_encoder() >> index.toks_indexer()
+        idx_pipeline = self.splade.doc_encoder(batch_size=3000) >> index.toks_indexer()
         
-        return idx_pipeline.index(iter_jsonl(corpus_path, transform_raw))
+        return idx_pipeline.index(tsv_corpus_generator(corpus_path))
 
 #Example usage
 if __name__ == '__main__':

@@ -1,6 +1,5 @@
 import os
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" #same order as nvidia-smi
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" 
 from Experiment import Experiment
 from tsvHandler import tsv_corpus_generator
 import pyterrier as pt
@@ -10,13 +9,12 @@ from pyterrier_pisa import PisaIndex
 from huggingface_hub import login
 import argparse
 from dotenv import load_dotenv
-from RankingManager import RankingManager
+from pooling import max_pooling, top_k_sum_pooling
 import json
 import pandas as pd
 from collections import defaultdict
 import csv
 load_dotenv()
-from typing import Literal
 #login(token=os.getenv('HF_TOKEN'))
 
 def parse_arguments():
@@ -72,9 +70,9 @@ def parse_arguments():
     parser.add_argument(
         '--pooling',
         type=str,
-        default=None,
+        default='maxp',
         choices=['maxp', 'top_k'],
-        help='(OPTIONAL) Pooling method. If not specified, tries all of them'
+        help='(OPTIONAL) Pooling method. Defaults to maxpooling'
     )
 
     args = parser.parse_args()
@@ -105,7 +103,7 @@ class SPLADE_PASSAGE(Experiment):
         
         return idx_pipeline.index(tsv_corpus_generator(corpus_path))
     
-    def results_tests(self, test_query_path: str, out_dir: str, experiment_name: str, pool_fn: Literal['max', 'topk'] | None, doc_id_map_path: str=None, docs_to_pool: int=3000, final_num_docs: int=1000):
+    def results_tests(self, test_query_path: str, out_dir: str, experiment_name: str, pool_fn, doc_id_map_path: str=None, docs_to_pool: int=3000, final_num_docs: int=1000):
         with open(test_query_path, 'r') as inp:
             qids, queries = [], []
             for line in inp:
@@ -120,19 +118,37 @@ class SPLADE_PASSAGE(Experiment):
         df_ans = search_pipeline.transform(topics)
 
         #Convert pyterrier dataframe into ranking
-        ranking = RankingManager(df_ans, doc_id_map_path)
+        qids_to_ranking = defaultdict(list)
+        for _, row in df_ans.iterrows():
+            qids_to_ranking[row['qid']].append((int(row['docno']), row['rank'], row['score']))
 
-        #Save pre-passages
-        base_path = f'{out_dir}/{self.name}-{experiment_name}'
-        ranking.raw_passage_ranking_to_csv(base_path + '-prepassages.csv', f'{self.name}-prepassage')
+        for ranking in qids_to_ranking.values():
+            ranking.sort(key=lambda x: x[2], reverse=True)
 
-        #Pool! (and save)
-        if (pool_fn == 'max' or pool_fn == None):
-            pooled = ranking.max_pooling(final_num_docs)
-            ranking.save_rankings_as_trec_csv(pooled, base_path + f'-run-max.csv', f'{self.name}-max')
-        if (pool_fn == 'topk' or pool_fn == None):
-            pooled = ranking.top_k_sum_pooling(final_num_docs)
-            ranking.save_rankings_as_trec_csv(pooled, base_path + f'-run-top3.csv', f'{self.name}-top3')
+        #Also convert docids, if needed
+        if doc_id_map_path:
+            with open(doc_id_map_path, 'r') as inp:
+                doc_id_mapper = json.load(inp)
+            for ranking in qids_to_ranking.values():
+                for i in range(len(ranking)): #Converts all docids
+                    docid, *rest = ranking[i]
+                    ranking[i] = (doc_id_mapper[docid], *rest)
+        
+        final_ranking = pool_fn(qids_to_ranking, final_num_docs) #Convert to qid -> proper ranking dict
+
+        with open(f'{out_dir}/{self.name}-{experiment_name}-run.csv', 'w', encoding='utf-8', newline='') as outp:
+            writer = csv.writer(outp)
+            writer.writerow(['qid', 'Q', 'docno', 'rank', 'score', 'run_id'])
+            for qid, ranking in final_ranking.items():
+                for (docid, rank, score) in ranking:
+                    writer.writerow([
+                        qid, 
+                        'Q0',
+                        docid,
+                        rank,
+                        score,
+                        f'{self.name}-{pool_fn.__name__}',
+                    ])
 
 #Example usage
 if __name__ == '__main__':
@@ -142,9 +158,8 @@ if __name__ == '__main__':
     for exp_name, queries in zip(args.experiment_names, args.queries_paths):
         #Max pooling
         if args.pooling == 'maxp':
-            splade.results_tests(queries, args.out_dir, exp_name, 'max', args.doc_id_map_path, 3000, 1000)
+            splade.results_tests(queries, args.out_dir, exp_name, max_pooling, args.doc_id_map_path, 3000, 1000)
         #top-k-sum pooling
-        elif args.pooling == 'top_k':
-            splade.results_tests(queries, args.out_dir, exp_name, 'topk', args.doc_id_map_path, 10_000, 1000)
-        else:
-            splade.results_tests(queries, args.out_dir, exp_name, None, args.doc_id_map_path, 10_000, 1000)
+        if args.pooling == 'top_k':
+            print('top pooling')
+            splade.results_tests(queries, args.out_dir, exp_name, top_k_sum_pooling, args.doc_id_map_path, 10_000, 1000)

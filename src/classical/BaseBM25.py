@@ -18,8 +18,8 @@ class BM25(Experiment):
     
     def build_index(self, index_path: str, corpus_path: str):
         #Index raw data
-        return (pt.IterDictIndexer(index_path, meta={'docno': 20}, blocks=True, threads=8)
-                    .index(tsv_corpus_generator(corpus_path)))
+        return (pt.IterDictIndexer(index_path, meta={'docno': 20, 'text': 559999}, blocks=True, threads=16, meta_reverse=['docno'])
+                    .index(tsv_corpus_generator(corpus_path, skip_duplicate_docnos=True)))
 
 #Example usage
 if __name__ == '__main__':

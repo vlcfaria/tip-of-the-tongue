@@ -9,9 +9,13 @@ while True:
     except OverflowError:
         max_int = int(max_int / 10)
 
-def tsv_corpus_generator(file_path: str):
+def tsv_corpus_generator(file_path: str, skip_duplicate_docnos: bool = False):
+    seen_docnos = set()
     with open(file_path, 'r', encoding='utf-8', newline='') as file:
         reader = csv.reader(file, delimiter='\t')
         
         for row in reader:
-            yield { 'docno': row[0], 'text': row[1] }
+            docno = row[0]
+            if skip_duplicate_docnos and docno not in seen_docnos:
+                seen_docnos.add(docno)
+                yield { 'docno': docno, 'text': row[1] }

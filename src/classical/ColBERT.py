@@ -1,16 +1,16 @@
 from io import TextIOWrapper
 import os
+from typing import Literal, Union
+from RankingManager import RankingManager
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" #same order as nvidia-smi
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 from Experiment import Experiment
 from colbert.data import Queries
 from colbert.infra import Run, RunConfig, ColBERTConfig
 from colbert import Searcher, Indexer
-from pooling import max_pooling, top_k_sum_pooling
 import argparse
-import csv
-import json
 import torch
+import pickle
 
 def parse_arguments():
     """Creates a parser with common arguments for IR pipelines."""
@@ -65,9 +65,9 @@ def parse_arguments():
     parser.add_argument(
         '--pooling',
         type=str,
-        default='maxp',
+        default=None,
         choices=['maxp', 'top_k'],
-        help='(OPTIONAL) Pooling method. Defaults to maxpooling'
+        help='(OPTIONAL) Pooling method. If blank, tries all of them.'
     )
 
     args = parser.parse_args()
@@ -122,7 +122,7 @@ class ColBERT(Experiment):
         
         return None #Not used here
     
-    def results_tests(self, test_query_path: str, out_dir: str, experiment_name: str, pool_fn, doc_id_map_path: str=None, docs_to_pool: int=3000, final_num_docs: int=1000):
+    def results_tests(self, test_query_path: str, out_dir: str, experiment_name: str, pool_fn: Union[Literal['max', 'topk'], None], doc_id_map_path: str=None, docs_to_pool: int=3000, final_num_docs: int=1000):
         'Outputs the query results (up to 1000) for each test query, using the search pipeline'
 
         #Load queries tsv
@@ -131,29 +131,21 @@ class ColBERT(Experiment):
         #Search for more than we will actually output, since we will apply some sort of pooling
         ans = self.search_pipeline.search_all(queries, k=docs_to_pool)
 
-        if doc_id_map_path:
-            with open(doc_id_map_path, 'r') as inp:
-                doc_id_mapper = json.load(inp)
-            for __builtins__, ranking in ans.items():
-                for i in range(len(ranking)): #Converts all docids
-                    docid, *rest = ranking[i]
-                    ranking[i] = (doc_id_mapper[docid], *rest)
-        
-        final_ranking = pool_fn(ans, final_num_docs) #Convert to qid -> proper ranking
+        ranking = RankingManager(ans, doc_id_map_path)
 
-        with open(f'{out_dir}/{self.name}-{experiment_name}-run.csv', 'w', encoding='utf-8', newline='') as outp:
-            writer = csv.writer(outp)
-            writer.writerow(['qid', 'Q', 'docno', 'rank', 'score', 'run_id'])
-            for qid, ranking in final_ranking.items():
-                for (docid, rank, score) in ranking:
-                    writer.writerow([
-                        qid, 
-                        'Q0',
-                        docid,
-                        rank,
-                        score,
-                        f'{self.name}-{self.config.nbits}bits-{self.config.ncells or "default"}cells-{self.config.centroid_score_threshold or "default"}threshold-{self.config.ndocs or "default"}ndocs',
-                    ])            
+        #Save pre-passages
+        base_path = f'{out_dir}/{self.name}-{experiment_name}'
+        ranking.raw_passage_ranking_to_csv(base_path + '-prepassages.csv', f'{self.name}-prepassage')
+
+        suffix = f'{self.config.nbits}bits-{self.config.ncells or "default"}cells-{self.config.centroid_score_threshold or "default"}threshold-{self.config.ndocs or "default"}ndocs'
+        
+        #Pool! (and save)
+        if (pool_fn == 'max' or pool_fn == None):
+            pooled = ranking.max_pooling(final_num_docs)
+            ranking.save_rankings_as_trec_csv(pooled, base_path + f'-run-max.csv', f'{self.name}-{suffix}-max')
+        if (pool_fn == 'topk' or pool_fn == None):
+            pooled = ranking.top_k_sum_pooling(final_num_docs)
+            ranking.save_rankings_as_trec_csv(pooled, base_path + f'-run-top3.csv', f'{self.name}-{suffix}-top3')          
             
     def benchmark(self, topics_path: str, qrels_path: str, out_dir: str = ''):
         raise NotImplementedError()
@@ -170,8 +162,9 @@ if __name__ == '__main__':
     for exp_name, queries in zip(args.experiment_names, args.queries_paths):
         #Max pooling
         if args.pooling == 'maxp':
-            colbert.results_tests(queries, args.out_dir, exp_name, max_pooling, args.doc_id_map_path, 3000, 1000)
+            colbert.results_tests(queries, args.out_dir, exp_name, 'max', args.doc_id_map_path, 10_000, 1000)
         #top-k-sum pooling
-        if args.pooling == 'top_k':
-            print('top pooling')
-            colbert.results_tests(queries, args.out_dir, exp_name, top_k_sum_pooling, args.doc_id_map_path, 20_000, 1000)
+        elif args.pooling == 'top_k':
+            colbert.results_tests(queries, args.out_dir, exp_name, 'topk', args.doc_id_map_path, 10_000, 1000)
+        else:
+            colbert.results_tests(queries, args.out_dir, exp_name, None, args.doc_id_map_path, 10_000, 1000)

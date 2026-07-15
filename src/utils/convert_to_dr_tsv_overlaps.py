@@ -10,13 +10,13 @@ from transformers import AutoTokenizer
 import math
 
 DATASET_PATH = './dataset/corpus-cleaned-sections.jsonl'
-OUTPUT_PATH = './dataset/cleaned-corpus-splade-tokenized-overlap.tsv'
-TRANSLATION_PATH = './dataset/cleaned-idx-to-pid-splade-overlap.json'
+OUTPUT_PATH = './dataset/cleaned-corpus-bge-tokenized-overlap.tsv'
+TRANSLATION_PATH = './dataset/cleaned-idx-to-pid-bge-overlap.json'
 
 CHUNK_SIZE = 256 - 2 # Account for CLS and SEP
 OVERLAP = 30
 DOC_BATCH_SIZE = 1000
-TOKENIZER_NAME = 'naver/splade-v3'
+TOKENIZER_NAME = 'microsoft/harrier-oss-v1-270m'
 NUM_PROCS = 24
 MIN_TOKENS = 35
 MAX_PREFIX_TOKENS = 64 # Prevent unusually long titles/headings from consuming the whole chunk

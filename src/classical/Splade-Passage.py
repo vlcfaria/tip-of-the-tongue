@@ -1,7 +1,7 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" #same order as nvidia-smi
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-from Experiment import Experiment
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+from Experiment import Experiment, parse_arguments
 from tsvHandler import tsv_corpus_generator
 import pyterrier as pt
 import pyterrier_alpha as pta
@@ -19,99 +19,46 @@ load_dotenv()
 from typing import Literal
 #login(token=os.getenv('HF_TOKEN'))
 
-def parse_arguments():
-    """Creates a parser with common arguments for IR pipelines."""
-    parser = argparse.ArgumentParser(
-        description="A script to reproduce an Information Retrieval (IR) pipeline using Splade, with passage indexing",
-        formatter_class=argparse.RawTextHelpFormatter,
-        add_help=True
-    )
-
-    parser.add_argument(
-        'index_path',
-        type=str,
-        help='Path to the index directory.'
-    )
-
-    parser.add_argument(
-        'out_dir',
-        type=str,
-        default=None,
-        help='Path to the output directory.'
-    )
-
-    parser.add_argument(
-        'experiment_names',
-        type=str,
-        nargs='+',
-        help='Name of the given experiment.'
-    )
-
-    parser.add_argument(
-        '--queries_paths',
-        type=str,
-        required=True,
-        nargs='+',
-        help='Path to the file containing the queries. Ordering must be the same as experiment_name'
-    )
-
-    parser.add_argument(
-        '--corpus_path',
-        type=str,
-        default=None,
-        help='(Optional) Path to the corpus to be indexed. Setting this option will index the corpus'
-    )
-
-    parser.add_argument(
-        '--doc_id_map_path',
-        type=str,
-        default=None,
-        help='(OPTIONAL) Path to list containing (converted) docid to ACTUAL docid'
-    )
-
-    parser.add_argument(
-        '--pooling',
-        type=str,
-        default=None,
-        choices=['maxp', 'top_k'],
-        help='(OPTIONAL) Pooling method. If not specified, tries all of them'
-    )
-
-    args = parser.parse_args()
-
-    if len(args.experiment_names) != len(args.queries_paths):
-        parser.error("The number of experiment_names must match the number of --queries_paths.")
-    
-    return args
-
 class SPLADE_PASSAGE(Experiment):
     '''SPLADE experimentation, with passage indexing instead of document indexing'''
     
-    def __init__(self, index_path: str, corpus_path: str= ''):
+    def __init__(self, index_path: str, corpus_path: str= '', query_model: str='naver/splade-v3'):
         super().__init__(index_path, corpus_path)
         
         self.name = 'splade-passage'
-        self.splade = pyt_splade.Splade(device='cuda:0', model='naver/splade-v3', max_length=512) #We use 512 max length for query encoding
+        self.query_model = query_model
+        print("using query model:", query_model)
+        self.splade = pyt_splade.Splade(device='cuda:0', model=query_model, max_length=512) #We use 512 max length for query encoding
         self.search_pipeline = None #Search pipeline is dynamic due to dynamic documents to pool
     
     def get_index(self, index_path: str):
-        return PisaIndex(index_path, stemmer='none') #Multithreading is giving segfaults when searching
+        return PisaIndex(index_path, stemmer='none', threads=32) #Multithreading is giving segfaults when searching
     
     def build_index(self, index_path: str, corpus_path: str):
         #max token is a bit lower for indexing
         splade = pyt_splade.Splade(device='cuda:0', model='naver/splade-v3', max_length=256)
-        index = PisaIndex(index_path, stemmer='none', threads=16, batch_size=3_000_000)
+        index = PisaIndex(index_path, stemmer='none', threads=32, batch_size=3_000_000)
         idx_pipeline = splade.doc_encoder(batch_size=512) >> index.toks_indexer()
         
         return idx_pipeline.index(tsv_corpus_generator(corpus_path))
     
-    def results_tests(self, test_query_path: str, out_dir: str, experiment_name: str, pool_fn: Literal['max', 'topk'] | None, doc_id_map_path: str=None, docs_to_pool: int=3000, final_num_docs: int=1000):
+    def results_tests(
+        self, 
+        test_query_path: str, 
+        out_dir: str, 
+        experiment_name: str, 
+        pool_fn: Literal['max', 'topk'] | None, 
+        doc_id_map_path: str=None, 
+        docs_to_pool: int=3000, 
+        final_num_docs: int=1000,
+        query_key: str='query'
+    ):
         with open(test_query_path, 'r') as inp:
             qids, queries = [], []
             for line in inp:
                 obj = json.loads(line)
                 qids.append(obj['query_id'])
-                queries.append(obj['query'])
+                queries.append(obj[query_key])
                 
         topics = pd.DataFrame({'qid': qids, 'query': queries})
         topics = topics.astype({'qid': 'object', 'query': 'object'})
@@ -136,15 +83,16 @@ class SPLADE_PASSAGE(Experiment):
 
 #Example usage
 if __name__ == '__main__':
-    args = parse_arguments()
-    splade = SPLADE_PASSAGE(args.index_path, args.corpus_path)
+    args = parse_arguments(True)
+    print(args.model)
+    splade = SPLADE_PASSAGE(args.index_path, args.corpus_path, args.model)
 
     for exp_name, queries in zip(args.experiment_names, args.queries_paths):
         #Max pooling
         if args.pooling == 'maxp':
-            splade.results_tests(queries, args.out_dir, exp_name, 'max', args.doc_id_map_path, 3000, 1000)
+            splade.results_tests(queries, args.out_dir, exp_name, 'max', args.doc_id_map_path, 3_000, 1000, args.query_key)
         #top-k-sum pooling
         elif args.pooling == 'top_k':
-            splade.results_tests(queries, args.out_dir, exp_name, 'topk', args.doc_id_map_path, 10_000, 1000)
+            splade.results_tests(queries, args.out_dir, exp_name, 'topk', args.doc_id_map_path, 3_000, 1000, args.query_key)
         else:
-            splade.results_tests(queries, args.out_dir, exp_name, None, args.doc_id_map_path, 10_000, 1000)
+            splade.results_tests(queries, args.out_dir, exp_name, None, args.doc_id_map_path, 3_000, 1000, args.query_key)

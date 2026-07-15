@@ -1,6 +1,6 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" #same order as nvidia-smi
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "32"
 
 import json
@@ -8,110 +8,164 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 import math
 
-DATASET_PATH = './dataset/corpus.jsonl'
+DATASET_PATH = './dataset/corpus-cleaned-sections.jsonl'
 OUTPUT_PATH = './dataset/corpus_colbert_tokenized_overlap.tsv'
 TRANSLATION_PATH = './dataset/idx_to_pid_colbert_overlap.json'
 
-CHUNK_SIZE = 256 - 2 #Account for CLS and SEP
-OVERLAP = 64
+CHUNK_SIZE = 180 - 2 #Account for CLS and SEP
+OVERLAP = 16
 DOC_BATCH_SIZE = 1000
 TOKENIZER_NAME = 'colbert-ir/colbertv2.0'
-NUM_PROCS = 32
+NUM_PROCS = 24
+MIN_TOKENS = 35
+MAX_PREFIX_TOKENS = 64 # Prevent unusually long titles/headings from consuming the whole chunk
 
 print("Initializing tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, use_fast=True)
 
 def process_and_chunk_batch(batch):
     """
-    This function processes a batch of documents (as a dict) 
-    and returns a dict of the resulting passages.
-
-    This version prepends the *title* to *every* chunk
-    and adjusts the text chunk size to respect the token limit.
+    Processes a batch of documents containing sections.
+    Prepends 'Title - Heading. ' dynamically based on where the sliding 
+    window starts, allowing text to freely flow across section boundaries.
     """
-    
     batch_passage_texts = []
     batch_passage_pids = []
     
-    for i, doc_id in enumerate(batch['doc_id']):
+    for i, doc_id in enumerate(batch['id']):
         title_str = batch.get('title', [''])[i]
-        text_str = batch.get('text', [''])[i]
-
-        #Tokenize the title
-        title_prefix = f"{title_str}. " if title_str else ""
-        title_encoding = tokenizer(
-            title_prefix, 
-            add_special_tokens=False, 
-            max_length=CHUNK_SIZE, 
-            truncation=True
-        )
         
-        title_tokens = title_encoding.input_ids
-        title_len = len(title_tokens)
+        # Extract sections. Default to empty list if missing.
+        sections = batch.get('sections', [[]])[i] 
         
-        #Calculate remaining space for the main text
-        text_chunk_size = CHUNK_SIZE - title_len
-
-        #Handle edge case: Title is longer than or equals the chunk size
-        if text_chunk_size <= 0:
-            batch_passage_texts.append(title_prefix)
-            batch_passage_pids.append(doc_id)
-            print(f'Warning! {doc_id} title above limit on tokenization')
+        if not sections:
             continue
-
-        text_stride = text_chunk_size - OVERLAP
-        if text_stride < 1:
-            text_stride = 1
-
+            
+        doc_text = ""
+        section_boundaries = [] # Will store: (start_char_idx, end_char_idx, heading_string)
+        
+        # 1. Reconstruct the full document text while tracking where sections start/end
+        for sec in sections:
+            heading = sec.get('heading', '').strip().replace('\n', ' ').replace('\r', '').replace('\t', ' ')
+            body = sec.get('text', '').strip().replace('\n', ' ').replace('\r', '').replace('\t', ' ')
+            
+            sec_str = ""
+            if heading:
+                suffix = "" if heading[-1] in ".!?:;" else "."
+                # Simply inject the label. The previous body's trailing space handles the gap.
+                sec_str += f"Section: {heading}{suffix} "
+                
+            if body:
+                suffix = "" if body[-1] in ".!?" else "."
+                sec_str += f"{body}{suffix} "
+            
+            start_c = len(doc_text)
+            doc_text += sec_str
+            end_c = len(doc_text)
+            
+            section_boundaries.append((start_c, end_c, heading))
+            
         text_encoding = tokenizer(
-            text_str,
+            doc_text,
             add_special_tokens=False,
-            truncation=False, # We will do our own chunking
+            truncation=False,
             padding=False,
             return_offsets_mapping=True
         )
         text_tokens = text_encoding.input_ids
         text_offsets = text_encoding.offset_mapping
-
+        
         start = 0
-        while True:
-            end = start + text_chunk_size
-            
-            chunk_text_ids = text_tokens[start:end]
-            chunk_text_offsets = text_offsets[start:end]
-
-            if not chunk_text_ids:
-                break
-            
-            # Find valid character offsets
-            valid_offsets = [o for o in chunk_text_offsets if o is not None]
-            
-            if not valid_offsets:
-                 # This chunk might be just padding or empty, skip
-                if end >= len(text_tokens):
+        while start < len(text_tokens):
+            # 3. Find the valid character start offset for the current token window
+            start_char = None
+            for offset in text_offsets[start:]:
+                if offset is not None:
+                    start_char = offset[0]
                     break
-                start += text_stride
+                    
+            if start_char is None:
+                break # Reached the end with no valid characters
+                
+            # 4. Determine which section this chunk is currently starting in
+            active_heading = ""
+            for (sec_start, sec_end, h) in section_boundaries:
+                if sec_start <= start_char < sec_end:
+                    active_heading = h
+                    break
+                    
+            # 5. Construct the dynamic prefix
+            if title_str and active_heading:
+                suffix = "" if active_heading[-1] in ".!?" else "."
+                prefix_str = f"{title_str} - Section: {active_heading}{suffix} "
+            elif title_str:
+                suffix = "" if title_str[-1] in ".!?" else "."
+                prefix_str = f"{title_str}{suffix} "
+            elif active_heading:
+                suffix = "" if active_heading[-1] in ".!?" else "."
+                prefix_str = f"Section: {active_heading}{suffix} "
+            else:
+                prefix_str = ""
+                
+            # Tokenize prefix to find its exact length. Truncate if wildly long.
+            prefix_encoding = tokenizer(
+                prefix_str,
+                add_special_tokens=False,
+                max_length=MAX_PREFIX_TOKENS,
+                truncation=True
+            )
+            prefix_tokens = prefix_encoding.input_ids
+            
+            # If the prefix was truncated, decode it back to string to ensure clean text
+            if len(prefix_tokens) == MAX_PREFIX_TOKENS:
+                prefix_str = tokenizer.decode(prefix_tokens).strip() + " "
+                
+            prefix_len = len(prefix_tokens)
+            available_space = CHUNK_SIZE - prefix_len
+            
+            # 6. Extract the chunk body using the remaining available space
+            end = start + available_space
+            chunk_text_ids = text_tokens[start:end]
+            
+            # Discard if it's too short AND it's not the very first chunk
+            if len(chunk_text_ids) < MIN_TOKENS and start > 0:
+                break
+                
+            chunk_offsets = [o for o in text_offsets[start:end] if o is not None]
+            if not chunk_offsets:
+                start += available_space
                 continue
-
-            # Get the character boundaries from the *original text string*
-            start_char = valid_offsets[0][0]
-            end_char = valid_offsets[-1][1]
+                
+            chunk_start_char = chunk_offsets[0][0]
+            chunk_end_char = chunk_offsets[-1][1]
             
-            passage_text_body = text_str[start_char:end_char]
+            passage_text_body = doc_text[chunk_start_char:chunk_end_char]
             
-            # 7. Assemble the final passage
-            final_passage_text = f"{title_prefix}{passage_text_body}"
+            # 7. Deduplication Check
+            clean_body = passage_text_body.lstrip()
             
-            batch_passage_texts.append(final_passage_text.strip())
+            # Look for the exact string we embedded in Step 1
+            expected_heading_text = f"Section: {active_heading}"
+            
+            if active_heading and clean_body.startswith(expected_heading_text):
+                # Slice out the heading and strip any residual colons, periods, or spaces
+                clean_body = clean_body[len(expected_heading_text):].lstrip(" .:")
+                
+            # 8. Assemble the final passage
+            final_passage_text = f"{prefix_str}{clean_body}".strip()
+            
+            batch_passage_texts.append(final_passage_text)
             batch_passage_pids.append(doc_id)
             
-            # If this is the last chunk, stop
             if end >= len(text_tokens):
                 break
+                
+            prev_start = start
+            start = end - OVERLAP
             
-            # Move the window
-            start += text_stride
-    
+            if start <= prev_start:
+                start = prev_start + 1
+                
     return {
         "passage_text": batch_passage_texts,
         "original_doc_id": batch_passage_pids
@@ -123,7 +177,6 @@ def main():
     ds = load_dataset('json', data_files=DATASET_PATH, split='train')
     
     print(f"Original dataset size: {len(ds)} documents")
-
     print(f"Starting parallel processing with {NUM_PROCS} workers...")
 
     passage_ds = ds.map(
@@ -136,29 +189,21 @@ def main():
 
     print(f"\nFinished processing. Total passages created: {len(passage_ds)}")
 
-    # 1. Save the passage-to-doc_id mapping
     print(f"Saving index-to-document_id mapping to {TRANSLATION_PATH}...")
-    # We can just extract the column directly
     pids = passage_ds['original_doc_id']
     with open(TRANSLATION_PATH, 'w') as outp:
-        json.dump(pids, outp)
+        json.dump(list(pids), outp)
     
-    # 2. Save the final TSV
     print(f"Adding passage index and saving to {OUTPUT_PATH}...")
-    
-    # Add the new passage_idx column (0, 1, 2, ...)
     passage_ds = passage_ds.add_column("passage_idx", range(len(passage_ds)))
-    
-    # Select and reorder columns for the final TSV
     passage_ds = passage_ds.select_columns(["passage_idx", "passage_text"])
     
-    # Save to TSV, also in parallel and batched
     passage_ds.to_csv(
         OUTPUT_PATH,
         sep='\t',
         header=False,
         index=False,
-        batch_size=DOC_BATCH_SIZE * 10 # Use a larger batch for writing
+        batch_size=DOC_BATCH_SIZE * 10
     )
     
     print("Done.")

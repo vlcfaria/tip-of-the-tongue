@@ -1,4 +1,23 @@
 indexes/
+dataset-2024/
+trec-2024-data/
+.vscode/
+models/
+llm/
+llama/
+
+
+# Ignore everything in queries/ and results/ except .py and .ipynb
+queries/**
+!queries/**/
+!queries/**/*.py
+!queries/**/*.ipynb
+
+results/**
+!results/**/
+!results/**/*.py
+!results/**/*.ipynb
+
 dataset/
 .venv*/
 

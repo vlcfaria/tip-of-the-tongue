@@ -4,16 +4,12 @@ import json
 import argparse
 import sys
 
-def parse_arguments():
+def parse_arguments(passage_args:bool= False):
+    """Creates a parser with common arguments for IR pipelines."""
     parser = argparse.ArgumentParser(
-        description="A script to reproduce an Information Retrieval (IR) pipeline using PyTerrier.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-
-    parser.add_argument(
-        'experiment_name',
-        type=str,
-        help='Name of the given experiment.'
+        description="A script to reproduce an Information Retrieval (IR) pipeline using Splade, with passage indexing",
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=True
     )
 
     parser.add_argument(
@@ -23,40 +19,75 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        'queries_path',
+        'out_dir',
         type=str,
-        help='Path to the file containing the queries.'
+        default=None,
+        help='Path to the output directory.'
+    )
+
+    parser.add_argument(
+        'experiment_names',
+        type=str,
+        nargs='+',
+        help='Name of the given experiment.'
+    )
+
+    parser.add_argument(
+        '--queries_paths',
+        type=str,
+        required=True,
+        nargs='+',
+        help='Path to the file containing the queries. Ordering must be the same as experiment_name'
     )
 
     parser.add_argument(
         '--corpus_path',
         type=str,
         default=None,
-        help='(Optional) Path to the corpus that was indexed.'
+        help='(Optional) Path to the corpus to be indexed. Setting this option will index the corpus'
+    )
+
+    if passage_args:
+        parser.add_argument(
+            '--doc_id_map_path',
+            type=str,
+            default=None,
+            help='(OPTIONAL) Path to list containing (converted) docid to ACTUAL docid'
+        )
+
+        parser.add_argument(
+            '--pooling',
+            type=str,
+            default=None,
+            choices=['maxp', 'top_k'],
+            help='(OPTIONAL) Pooling method. If not specified, tries all of them'
+        )
+
+    parser.add_argument(
+        '--query_key',
+        type=str,
+        default='query',
+        help='(OPTIONAL) Defines the key to access the query string in the input .jsonl'
     )
 
     parser.add_argument(
-        '--qrels',
+        '--model',
         type=str,
         default=None,
-        help='Path to the qrels file for evaluation.'
+        help='(OPTIONAL) Defines the model name to be used, if the script allows it'
     )
 
     parser.add_argument(
-        '--out_dir',
+        '--experiment_name',
         type=str,
         default=None,
-        help='Path to the output directory. Mandatory if --qrels is not provided.'
+        help='(OPTIONAL) Custom experiment name to be used, if the script allows it'
     )
-
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
-        sys.exit(1)
 
     args = parser.parse_args()
 
-    if not args.qrels and not args.out_dir:
-        parser.error('argument --out_dir is required when --qrels is not provided.')
+    if len(args.experiment_names) != len(args.queries_paths):
+        parser.error("The number of experiment_names must match the number of --queries_paths.")
     
     return args
 
@@ -113,7 +144,7 @@ class Experiment():
             qids, queries = [], []
             for line in inp:
                 obj = json.loads(line)
-                qids.append(obj['query_id'])
+                qids.append(str(obj['query_id']))
                 queries.append(obj['query'])
                 
         topics = pd.DataFrame({'qid': qids, 'query': queries})

@@ -16,6 +16,27 @@ def tsv_corpus_generator(file_path: str, skip_duplicate_docnos: bool = False):
         
         for row in reader:
             docno = row[0]
-            if skip_duplicate_docnos and docno not in seen_docnos:
+            
+            if skip_duplicate_docnos:
+                if docno in seen_docnos:
+                    continue
                 seen_docnos.add(docno)
-                yield { 'docno': docno, 'text': row[1] }
+            
+            yield { 'docno': docno, 'text': row[1] }
+
+def tsv_corpus_generator_optimized(file_path: str, chunk_size: int = 10000):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        reader = csv.reader(file, delimiter='\t')
+        
+        chunk = []
+        for row in reader:
+            if len(row) < 2: 
+                continue
+            chunk.append({'docno': row[0], 'text': row[1]})
+            
+            if len(chunk) >= chunk_size:
+                yield from chunk
+                chunk = []
+                
+        if chunk:  # Yield the remainder
+            yield from chunk

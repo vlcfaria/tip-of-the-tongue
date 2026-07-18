@@ -1,34 +1,53 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import csv
 import json
+import math
 import torch
 import pandas as pd
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sentence_transformers import CrossEncoder
 from collections import defaultdict
 from tqdm import tqdm
 import argparse
 
 
 class Reranker:
-    def __init__(self, model_name="nvidia/llama-nemotron-rerank-1b-v2", batch_size=128, max_length=1024, device="cuda", pool="max", pool_k=3):
+    def __init__(self, model_name="nvidia/llama-nemotron-rerank-1b-v2", model_type="seq_cls",
+                 batch_size=128, max_length=1024, device="cuda", pool="max", pool_k=3):
         self.device = device
         self.batch_size = batch_size
         self.max_length = max_length
         self.pool = pool
         self.pool_k = pool_k
+        self.model_type = model_type
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
-        ).to(self.device).eval()
-
-        if self.model.config.pad_token_id is None:
-            self.model.config.pad_token_id = self.tokenizer.eos_token_id
+        if model_type == "qwen_yesno":
+            #Qwen3-Reranker ships its own chat/prompt template + yes/no logit-diff scoring.
+            #Task-specific instruction (model card recommends tailoring it for ~1-5% gain).
+            self.model = CrossEncoder(
+                model_name, max_length=max_length, device=device,
+                trust_remote_code=True, automodel_args={"torch_dtype": torch.bfloat16},
+                tokenizer_kwargs={"padding_side": "left"},
+                prompts={"tot": "Given a user's description of a document they partially remember, retrieve the matching document passage"},
+                default_prompt_name="tot",
+            )
+            if self.model.tokenizer.pad_token is None:
+                self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
+            if self.model.config.pad_token_id is None:
+                self.model.config.pad_token_id = self.model.tokenizer.pad_token_id
+        elif model_type == "seq_cls":
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+            self.tokenizer.pad_token = self.tokenizer.pad_token or self.tokenizer.eos_token
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
+            ).to(self.device).eval()
+            if self.model.config.pad_token_id is None:
+                self.model.config.pad_token_id = self.tokenizer.eos_token_id
+        else:
+            raise ValueError(f"unknown model_type {model_type!r} (expected 'seq_cls' or 'qwen_yesno')")
 
     def _load_queries(self, queries_path, query_key):
         "Reads queries.jsonl and builds pairs of query_id <-> query, from `query_key`"
@@ -64,9 +83,20 @@ class Reranker:
                         break
         return texts
 
-    def _cross_encode(self, batch):
-        "Applies the cross encoder to a batch of texts"
+    def _cross_encode(self, batch, retriever_tag=None):
+        "Applies the cross encoder to a batch of (query, passage) pairs"
 
+        if self.model_type == "qwen_yesno":
+            #CrossEncoder ships the Qwen3 chat template + yes/no logit-diff scoring.
+            #No retriever conditioning: the model was never trained with synthetic [dense]/[splade]
+            #prefixes, and injecting them shifts the query off the trained distribution *unevenly*
+            #per retriever, breaking the cross-retriever score scale assumed by merge().
+            pairs = [(p['query'], p['text']) for p in batch]
+            scores = self.model.predict(pairs, batch_size=self.batch_size,
+                                         activation_fn=torch.nn.Identity(), convert_to_numpy=True)
+            return scores.tolist()
+
+        # seq_cls (nemotron) path
         texts = [f"question:{p['query']} \n \n passage:{p['text']}" for p in batch]
         batch_dict = self.tokenizer(texts, padding=True, truncation=True,
                                     max_length=self.max_length, return_tensors="pt").to(self.device)
@@ -83,10 +113,16 @@ class Reranker:
                 pid = int(item['passage_id'])
                 doc_id = str(mapping[pid]) if pid < len(mapping) else str(pid)
                 per_doc[doc_id].append(item['ce_score'])
-            doc_scores = {
-                doc_id: sum(sorted(scores, reverse=True)[:self.pool_k])
-                for doc_id, scores in per_doc.items()
-            }
+            if self.model_type == "qwen_yesno":
+                doc_scores = {
+                    doc_id: sum(sorted(scores, reverse=True)[:self.pool_k])
+                    for doc_id, scores in per_doc.items()
+                }
+            else:
+                doc_scores = {
+                    doc_id: sum(1.0 / (1.0 + math.exp(-s)) for s in sorted(scores, reverse=True)[:self.pool_k])
+                    for doc_id, scores in per_doc.items()
+                }
         else:  # max
             doc_scores = {}
             for item in per_query_scored:
@@ -97,7 +133,7 @@ class Reranker:
                     doc_scores[doc_id] = s
         return dict(sorted(doc_scores.items(), key=lambda x: x[1], reverse=True))
 
-    def rerank_retriever(self, prepassage_csv, mapping_path, tsv_path, query_lookup, top_k):
+    def rerank_retriever(self, prepassage_csv, mapping_path, tsv_path, query_lookup, top_k, retriever_tag=None):
         # Get query -> passagenos mapping
         per_query = self._load_prepassages(prepassage_csv, top_k)
 
@@ -123,7 +159,7 @@ class Reranker:
         all_scores = []
         for i in tqdm(range(0, len(all_pairs), self.batch_size), desc="Cross-encoding"):
             batch = all_pairs[i:i + self.batch_size]
-            scores = self._cross_encode(batch)
+            scores = self._cross_encode(batch, retriever_tag=retriever_tag)
             for item, score in zip(batch, scores):
                 all_scores.append({**item, "ce_score": float(score)})
 
@@ -153,20 +189,27 @@ class Reranker:
 
     @staticmethod
     def save_passages(scored_by_qid, output_path, run_name):
-        "Cache CE-scored passages (pool-agnostic) to CSV"
+        "Cache CE-scored passages (pool-agnostic) in TREC run format: qid Q0 docno rank score run_id"
         rows = []
         for qid, items in scored_by_qid.items():
-            for item in items:
-                rows.append({"qid": qid, "passage_id": item['passage_id'], "ce_score": item['ce_score']})
-        pd.DataFrame(rows).to_csv(output_path, index=False, columns=['qid', 'passage_id', 'ce_score'])
+            ranked = sorted(items, key=lambda x: x['ce_score'], reverse=True)
+            for rank, item in enumerate(ranked):
+                rows.append({
+                    "qid": qid, "Q": "Q0", "docno": item['passage_id'],
+                    "rank": rank, "score": item['ce_score'], "run_id": run_name,
+                })
+        pd.DataFrame(rows).to_csv(
+            output_path, index=False,
+            columns=['qid', 'Q', 'docno', 'rank', 'score', 'run_id'],
+        )
 
     @staticmethod
     def load_passages(csv_path):
-        "Load cached CE-scored passages into qid -> [items] lookup"
-        df = pd.read_csv(csv_path, dtype={'qid': 'str', 'passage_id': 'str'})
+        "Load cached CE-scored passages (TREC format) into qid -> [items] lookup"
+        df = pd.read_csv(csv_path, dtype={'qid': 'str', 'docno': 'str'})
         scored = defaultdict(list)
         for _, row in df.iterrows():
-            scored[row['qid']].append({"passage_id": row['passage_id'], "ce_score": float(row['ce_score'])})
+            scored[row['qid']].append({"passage_id": row['docno'], "ce_score": float(row['score'])})
         return dict(scored)
 
     @staticmethod
@@ -195,8 +238,12 @@ if __name__ == "__main__":
     parser.add_argument('--query_key', default='DENSE_query', help='Query field for CE input')
     parser.add_argument('--output', required=True, help='Output CSV path')
     parser.add_argument('--run_name', required=True, help='TREC run_id')
+    parser.add_argument('--model', default='nvidia/llama-nemotron-rerank-1b-v2',
+                        help='Cross-encoder checkpoint (HF id or local path)')
+    parser.add_argument('--model_type', choices=['seq_cls', 'qwen_yesno'], default='seq_cls',
+                        help="'seq_cls' (nemotron, scalar head) or 'qwen_yesno' (Qwen3-Reranker via sentence-transformers)")
     parser.add_argument('--top_k', type=int, default=1000, help='Passages per query per retriever')
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--pool', choices=['max', 'top3'], default='max',
                         help='Passage -> document pooling: "max" (best passage) or "top3" (sum of top-k passages)')
     parser.add_argument('--pool_k', type=int, default=3, help='k for top-k sum pooling (only used with --pool top3)')
@@ -212,7 +259,8 @@ if __name__ == "__main__":
 
     names = args.names if args.names else [f"r{i}" for i in range(n)]
 
-    reranker = Reranker(batch_size=args.batch_size, max_length=1024, pool=args.pool, pool_k=args.pool_k)
+    reranker = Reranker(model_name=args.model, model_type=args.model_type,
+                     batch_size=args.batch_size, max_length=1024, pool=args.pool, pool_k=args.pool_k)
     query_lookup = reranker._load_queries(args.queries_path, args.query_key)
 
     all_pooled = []
@@ -229,7 +277,7 @@ if __name__ == "__main__":
             print(f"\n=== Reranking: {names[i]} ===")
             scored_by_qid, mapping = reranker.rerank_retriever(
                 args.passage_runs[i], args.mappings[i], args.corpora[i],
-                query_lookup, args.top_k
+                query_lookup, args.top_k, retriever_tag=names[i]
             )
             reranker.save_passages(scored_by_qid, per_run, run_id)
             print(f"  -> {per_run}")
@@ -240,5 +288,6 @@ if __name__ == "__main__":
 
     print("\n=== Merging ===")
     merged = reranker.merge(*all_pooled) if len(all_pooled) > 1 else all_pooled[0]
-    reranker.save_trec(merged, args.output, args.run_name)
-    print(f"Saved to {args.output}")
+    merged_output = args.output.replace(".csv", "-merged.csv")
+    reranker.save_trec(merged, merged_output, args.run_name)
+    print(f"Saved to {merged_output}")

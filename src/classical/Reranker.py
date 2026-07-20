@@ -7,6 +7,7 @@ import json
 import math
 import torch
 import pandas as pd
+import pyterrier_alpha as pta
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import CrossEncoder
 from collections import defaultdict
@@ -29,10 +30,30 @@ class Reranker:
             #Task-specific instruction (model card recommends tailoring it for ~1-5% gain).
             self.model = CrossEncoder(
                 model_name, max_length=max_length, device=device,
-                trust_remote_code=True, automodel_args={"torch_dtype": torch.bfloat16},
+                trust_remote_code=True,
+                automodel_args={
+                    "torch_dtype": torch.bfloat16,
+                    "attn_implementation": "flash_attention_2",
+                },
                 tokenizer_kwargs={"padding_side": "left"},
                 prompts={"tot": "Given a user's description of a document they partially remember, retrieve the matching document passage"},
                 default_prompt_name="tot",
+            )
+            if self.model.tokenizer.pad_token is None:
+                self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
+            if self.model.config.pad_token_id is None:
+                self.model.config.pad_token_id = self.model.tokenizer.pad_token_id
+        elif model_type == "cross_encoder":
+            #Generic sentence-transformers CrossEncoder (e.g. BGE-reranker-base).
+            #Same scoring path as qwen_yesno (self.model.predict) but no chat template.
+            self.model = CrossEncoder(
+                model_name, max_length=max_length, device=device,
+                trust_remote_code=True,
+                automodel_args={
+                    "torch_dtype": torch.bfloat16,
+                    #"attn_implementation": "flash_attention_2",
+                },
+                tokenizer_kwargs={"padding_side": "left"},
             )
             if self.model.tokenizer.pad_token is None:
                 self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
@@ -47,7 +68,7 @@ class Reranker:
             if self.model.config.pad_token_id is None:
                 self.model.config.pad_token_id = self.tokenizer.eos_token_id
         else:
-            raise ValueError(f"unknown model_type {model_type!r} (expected 'seq_cls' or 'qwen_yesno')")
+            raise ValueError(f"unknown model_type {model_type!r} (expected 'seq_cls', 'qwen_yesno', or 'cross_encoder')")
 
     def _load_queries(self, queries_path, query_key):
         "Reads queries.jsonl and builds pairs of query_id <-> query, from `query_key`"
@@ -83,14 +104,61 @@ class Reranker:
                         break
         return texts
 
+    def _stream_doc_texts(self, jsonl_path, needed_ids):
+        "Stream a TREC-TOT corpus JSONL, keeping only doc IDs in `needed_ids`."
+
+        needed = {str(x) for x in needed_ids}
+        texts = {}
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                did = str(obj['id'])
+                if did in needed:
+                    title = obj.get('title') or ''
+                    body = obj.get('text') or ''
+                    texts[did] = f"{title}\n\n{body}" if title else body
+                    if len(texts) == len(needed):
+                        break
+        missing = needed - set(texts)
+        if missing:
+            print(f"[warn] _stream_doc_texts: {len(missing)} doc IDs not found in corpus (first few: {list(missing)[:5]})")
+        return texts
+
+    @staticmethod
+    def _rrf(per_query_runs, k=60, num_results=1000):
+        "Reciprocal Rank Fusion via pyterrier_alpha.fusion.rr_fusion."
+
+        dfs = []
+        for r in per_query_runs:
+            rows = []
+            for qid, docnos in r.items():
+                for rank, docno in enumerate(docnos):
+                    rows.append({
+                        "qid": str(qid),
+                        "query": str(qid),
+                        "docno": str(docno),
+                        "rank": rank,
+                        "score": float(num_results - rank),  #monotonic; RRF only uses rank
+                    })
+            dfs.append(pd.DataFrame(rows))
+
+        fused_df = pta.fusion.rr_fusion(*dfs, num_results=num_results, k=k)
+
+        fused = {}
+        for _, row in fused_df.iterrows():
+            qid = str(row["qid"])
+            docno = str(row["docno"])
+            fused.setdefault(qid, {})[docno] = float(row["score"])
+
+        return {
+            qid: dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
+            for qid, docs in fused.items()
+        }
+
     def _cross_encode(self, batch, retriever_tag=None):
         "Applies the cross encoder to a batch of (query, passage) pairs"
 
-        if self.model_type == "qwen_yesno":
-            #CrossEncoder ships the Qwen3 chat template + yes/no logit-diff scoring.
-            #No retriever conditioning: the model was never trained with synthetic [dense]/[splade]
-            #prefixes, and injecting them shifts the query off the trained distribution *unevenly*
-            #per retriever, breaking the cross-retriever score scale assumed by merge().
+        if self.model_type in ("qwen_yesno", "cross_encoder"):
             pairs = [(p['query'], p['text']) for p in batch]
             scores = self.model.predict(pairs, batch_size=self.batch_size,
                                          activation_fn=torch.nn.Identity(), convert_to_numpy=True)
@@ -171,6 +239,64 @@ class Reranker:
         #Return scored passages + mapping (pooling applied later)
         return dict(scored_by_qid), mapping
 
+    def rerank_documents(self, doc_run_csvs, corpus_path, query_lookup, top_k,
+                         rrf_k=60, rrf_output=None, rrf_run_name="rrf"):
+        "Document-level reranker: RRF-fuse doc-level TREC runs, then cross-encode (query, full_doc)."
+
+        per_retriever = [self._load_prepassages(p, top_k) for p in doc_run_csvs]
+
+        fused = self._rrf(per_retriever, k=rrf_k, num_results=top_k)
+
+        if rrf_output:
+            os.makedirs(os.path.dirname(rrf_output) or ".", exist_ok=True)
+            self.save_trec(fused, rrf_output, rrf_run_name)
+            print(f"  RRF-fused run saved to {rrf_output}")
+
+        all_needed = set()
+        for docnos in fused.values():
+            all_needed.update(docnos)
+
+        doc_texts = self._stream_doc_texts(corpus_path, all_needed)
+
+        pairs_by_qid = {}
+        for qid, docnos in tqdm(fused.items(), desc="Building doc pairs"):
+            if qid not in query_lookup:
+                continue
+            pairs_by_qid[qid] = [
+                {
+                    "qid": qid,
+                    "query": query_lookup[qid],
+                    "doc_id": did,
+                    "text": doc_texts.get(did, ""),
+                    "text_label": "document",
+                }
+                for did in docnos if did in doc_texts
+            ]
+
+        #Flatten + batch + score.
+        all_pairs = [p for pairs in pairs_by_qid.values() for p in pairs]
+        #Length-bucketed batching: sort by text length descending so each batch
+        #is internally length-homogeneous. Eliminates padding waste (a 12k-token
+        #doc in a random batch forces all 8 sequences to pad to 12k). Longest
+        #first also fails fast on OOM. The output set is unchanged — only the
+        #iteration order changes, so downstream aggregation still works.
+        all_pairs.sort(key=lambda p: len(p['text']), reverse=True)
+        all_scores = []
+        for i in tqdm(range(0, len(all_pairs), self.batch_size), desc="Cross-encoding"):
+            batch = all_pairs[i:i + self.batch_size]
+            scores = self._cross_encode(batch)
+            for item, score in zip(batch, scores):
+                all_scores.append({**item, "ce_score": float(score)})
+
+        ranked = {}
+        for item in all_scores:
+            ranked.setdefault(item['qid'], {})[item['doc_id']] = item['ce_score']
+
+        return {
+            qid: dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
+            for qid, docs in ranked.items()
+        }
+
     @staticmethod
     def merge(*retriever_scores):
         all_qids = set()
@@ -234,34 +360,69 @@ class Reranker:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cross-encoder reranker with multi-retriever score merging")
+    parser.add_argument('--mode', choices=['passage', 'document'], default='passage',
+                        help="'passage' (default, legacy) reranks passages then pools; "
+                             "'document' RRF-fuses doc-level runs and cross-encodes (query, full_doc) directly.")
     parser.add_argument('--queries_path', required=True, help='JSONL with queries')
     parser.add_argument('--query_key', default='DENSE_query', help='Query field for CE input')
     parser.add_argument('--output', required=True, help='Output CSV path')
     parser.add_argument('--run_name', required=True, help='TREC run_id')
     parser.add_argument('--model', default='nvidia/llama-nemotron-rerank-1b-v2',
                         help='Cross-encoder checkpoint (HF id or local path)')
-    parser.add_argument('--model_type', choices=['seq_cls', 'qwen_yesno'], default='seq_cls',
-                        help="'seq_cls' (nemotron, scalar head) or 'qwen_yesno' (Qwen3-Reranker via sentence-transformers)")
-    parser.add_argument('--top_k', type=int, default=1000, help='Passages per query per retriever')
+    parser.add_argument('--model_type', choices=['seq_cls', 'qwen_yesno', 'cross_encoder'], default='seq_cls',
+                        help="'seq_cls' (nemotron, scalar head), 'qwen_yesno' (Qwen3-Reranker via sentence-transformers), "
+                             "or 'cross_encoder' (generic sentence-transformers CrossEncoder, e.g. BGE-reranker-base)")
+    parser.add_argument('--top_k', type=int, default=1000, help='Passages/documents per query per retriever')
     parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--max_length', type=int, default=1024,
+                        help='Max sequence length for the cross-encoder. Use 8192+ for --mode document.')
     parser.add_argument('--pool', choices=['max', 'top3'], default='max',
-                        help='Passage -> document pooling: "max" (best passage) or "top3" (sum of top-k passages)')
-    parser.add_argument('--pool_k', type=int, default=3, help='k for top-k sum pooling (only used with --pool top3)')
-    parser.add_argument('--passage_runs', nargs='+', required=True, help='Prepassage CSV files')
-    parser.add_argument('--mappings', nargs='+', required=True, help='idx_to_pid JSON files')
-    parser.add_argument('--corpora', nargs='+', required=True, help='Passage TSV files')
-    parser.add_argument('--names', nargs='+', default=None, help='Retriever labels')
+                        help='Passage -> document pooling (passage mode only): "max" or "top3"')
+    parser.add_argument('--pool_k', type=int, default=3, help='k for top-k sum pooling (passage mode only)')
+    #Passage-mode inputs
+    parser.add_argument('--passage_runs', nargs='+', default=None, help='Prepassage CSV files (passage mode)')
+    parser.add_argument('--mappings', nargs='+', default=None, help='idx_to_pid JSON files (passage mode)')
+    parser.add_argument('--corpora', nargs='+', default=None, help='Passage TSV files (passage mode)')
+    parser.add_argument('--names', nargs='+', default=None, help='Retriever labels (passage mode)')
+    #Document-mode inputs
+    parser.add_argument('--doc_runs', nargs='+', default=None,
+                        help='Document-level TREC run CSVs to RRF-fuse then rerank (document mode)')
+    parser.add_argument('--doc_corpus', default=None,
+                        help='Document-level corpus JSONL with {id, title, text} (document mode)')
+    parser.add_argument('--rrf_k', type=int, default=60, help='RRF k (document mode)')
     args = parser.parse_args()
+
+    reranker = Reranker(model_name=args.model, model_type=args.model_type,
+                     batch_size=args.batch_size, max_length=args.max_length,
+                     pool=args.pool, pool_k=args.pool_k)
+    query_lookup = reranker._load_queries(args.queries_path, args.query_key)
+
+    if args.mode == "document":
+        if not args.doc_runs or not args.doc_corpus:
+            parser.error("--mode document requires --doc_runs and --doc_corpus")
+
+        print("\n=== Document-level rerank ===")
+        rrf_output = args.output.replace(".csv", "-rrf.csv")
+        rrf_run_name = f"{args.run_name}-rrf"
+
+        final = reranker.rerank_documents(
+            args.doc_runs, args.doc_corpus, query_lookup, args.top_k,
+            rrf_k=args.rrf_k, rrf_output=rrf_output, rrf_run_name=rrf_run_name,
+        )
+        reranker.save_trec(final, args.output, args.run_name)
+        print(f"Saved to {args.output}")
+        #End of document-mode path.
+        raise SystemExit(0)
+
+    #--- passage mode (legacy) ---
+    if not args.passage_runs or not args.mappings or not args.corpora:
+        parser.error("--mode passage requires --passage_runs, --mappings, --corpora")
 
     n = len(args.passage_runs)
     assert len(args.mappings) == n == len(args.corpora), \
         "--passage_runs, --mappings, --corpora must have equal length"
 
     names = args.names if args.names else [f"r{i}" for i in range(n)]
-
-    reranker = Reranker(model_name=args.model, model_type=args.model_type,
-                     batch_size=args.batch_size, max_length=1024, pool=args.pool, pool_k=args.pool_k)
-    query_lookup = reranker._load_queries(args.queries_path, args.query_key)
 
     all_pooled = []
     for i in range(n):
